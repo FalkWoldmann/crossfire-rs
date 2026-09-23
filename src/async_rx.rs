@@ -5,6 +5,7 @@ use crate::stream::AsyncStream;
 use crate::tokio_task_id;
 use crate::{shared::*, trace_log, MRx, NotCloneable, ReceiverType, Rx};
 use futures_core::Stream;
+use pin_project_lite::pin_project;
 use std::cell::Cell;
 use std::fmt;
 use std::future::Future;
@@ -359,16 +360,32 @@ impl<F: Flavor> Future for RecvFuture<'_, F> {
     }
 }
 
-/// A fixed-sized future object constructed by [AsyncRx::recv_timeout()]
-#[must_use]
-pub struct RecvTimeoutFuture<'a, F, FR, R>
-where
-    F: Flavor,
-    FR: Future<Output = R>,
-{
-    rx: &'a AsyncRx<F>,
-    waker: Option<<F::Recv as Registry>::Waker>,
-    sleep: FR,
+pin_project! {
+    /// A fixed-sized future object constructed by [AsyncRx::recv_timeout()]
+    #[must_use]
+    pub struct RecvTimeoutFuture<'a, F, FR, R>
+    where
+        F: Flavor,
+        FR: Future<Output = R>,
+    {
+        rx: &'a AsyncRx<F>,
+        waker: Option<<F::Recv as Registry>::Waker>,
+        #[pin]
+        sleep: FR,
+    }
+
+    impl<F, FR, R> PinnedDrop for RecvTimeoutFuture<'_, F, FR, R>
+    where
+        F: Flavor,
+        FR: Future<Output = R>,
+    {
+        fn drop(this: Pin<&mut Self>) {
+            let this = this.project();
+            if let Some(waker) = this.waker.as_ref() {
+                this.rx.shared.abandon_recv_waker(waker);
+            }
+        }
+    }
 }
 
 unsafe impl<F, FR, R> Send for RecvTimeoutFuture<'_, F, FR, R>
@@ -376,19 +393,6 @@ where
     F: Flavor,
     FR: Future<Output = R> + Send,
 {
-}
-
-impl<F, FR, R> Drop for RecvTimeoutFuture<'_, F, FR, R>
-where
-    F: Flavor,
-    FR: Future<Output = R>,
-{
-    #[inline]
-    fn drop(&mut self) {
-        if let Some(waker) = self.waker.as_ref() {
-            self.rx.shared.abandon_recv_waker(waker);
-        }
-    }
 }
 
 impl<F, FR, R> Future for RecvTimeoutFuture<'_, F, FR, R>
@@ -400,12 +404,10 @@ where
 
     #[inline]
     fn poll(self: Pin<&mut Self>, ctx: &mut Context) -> Poll<Self::Output> {
-        // NOTE: we can use unchecked to bypass pin because we are not movig "sleep",
-        // neither it's exposed outside
-        let mut _self = unsafe { self.get_unchecked_mut() };
-        match _self.rx.poll_item::<false>(ctx, &mut _self.waker) {
+        let this = self.project();
+        match this.rx.poll_item::<false>(ctx, this.waker) {
             Err(TryRecvError::Empty) => {
-                if unsafe { Pin::new_unchecked(&mut _self.sleep) }.poll(ctx).is_ready() {
+                if this.sleep.poll(ctx).is_ready() {
                     return Poll::Ready(Err(RecvTimeoutError::Timeout));
                 }
                 Poll::Pending

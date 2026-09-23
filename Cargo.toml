@@ -32,6 +32,7 @@ async-std = {version = "1", optional=true}
 log = { version="0.4", optional=true}
 smallvec = "1"
 pointers = "0"
+pin-project-lite = "0.2"
 
 [dev-dependencies]
 log = "0"

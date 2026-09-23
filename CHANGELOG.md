@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `flavor::ArraySpsc`, `ArrayMpsc`, `OneSpsc`, `OneMpsc` are no longer `Sync`, their `Queue::push()`/`pop()` assume a single producer or consumer.
 - `WaitGroup`, `WaitGroupZero` and their guards require `T: Send + Sync` to be `Send`/`Sync`.
 - `send_with_timer()`/`recv_with_timer()` in `AsyncTxTrait`/`AsyncRxTrait` require the timer future to be `Send`.
+- Use `pin-project-lite` for the timeout futures, and std APIs instead of several `unsafe` blocks.
 
 ### Fixed
 
@@ -25,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Soundness: `SendTimeoutFuture`/`RecvTimeoutFuture` were `Send` with a `!Send` timer.
 - Soundness: `WaitGroup(Zero)::try_into_inner()`/`get_mut()` could free or alias the shared state while a guard was still waking the waiter.
 - Soundness: two `WaitGroup::wait_async()` futures polled on different threads raced on the waker slot.
+- Soundness: `Multiplex::recv()` / `recv_timeout()` without any channel indexed an empty list.
 
 ## [3.1.20] - 2026-09-05
 

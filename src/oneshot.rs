@@ -42,6 +42,7 @@ use crate::shared::*;
 #[allow(unused_imports)]
 use crate::{tokio_task_id, trace_log};
 use core::cell::UnsafeCell;
+use pin_project_lite::pin_project;
 use std::future::Future;
 use std::pin::Pin;
 use std::ptr::NonNull;
@@ -565,12 +566,15 @@ impl<T> Future for RxOneshot<T> {
     }
 }
 
-pub struct OneshotTimeoutFuture<T, F, R>
-where
-    F: Future<Output = R>,
-{
-    rx: RxOneshot<T>,
-    sleep: F,
+pin_project! {
+    pub struct OneshotTimeoutFuture<T, F, R>
+    where
+        F: Future<Output = R>,
+    {
+        rx: RxOneshot<T>,
+        #[pin]
+        sleep: F,
+    }
 }
 
 impl<T, F, R> Future for OneshotTimeoutFuture<T, F, R>
@@ -581,16 +585,13 @@ where
 
     #[inline]
     fn poll(self: Pin<&mut Self>, ctx: &mut Context) -> Poll<Self::Output> {
-        // NOTE: we can use unchecked to bypass pin because we are not movig "sleep",
-        // neither it's exposed outside
-        let this = unsafe { self.get_unchecked_mut() };
+        let this = self.project();
         match this.rx.poll(ctx) {
             Poll::Ready(Ok(item)) => return Poll::Ready(Ok(item)),
             Poll::Ready(Err(())) => return Poll::Ready(Err(RecvTimeoutError::Disconnected)),
             _ => {}
         }
-        let sleep = unsafe { Pin::new_unchecked(&mut this.sleep) };
-        if sleep.poll(ctx).is_ready() {
+        if this.sleep.poll(ctx).is_ready() {
             Poll::Ready(Err(RecvTimeoutError::Timeout))
         } else {
             Poll::Pending
@@ -600,7 +601,7 @@ where
 
 #[inline]
 pub fn oneshot<T>() -> (TxOneshot<T>, RxOneshot<T>) {
-    let p = unsafe { NonNull::new_unchecked(Box::into_raw(OneShotInner::new())) };
+    let p = NonNull::from(Box::leak(OneShotInner::new()));
     let tx = TxOneshot(p);
     let rx = RxOneshot(Some(p));
     (tx, rx)

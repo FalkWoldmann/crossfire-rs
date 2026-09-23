@@ -4,6 +4,7 @@ use crate::sink::AsyncSink;
 use crate::tokio_task_id;
 use crate::weak::WeakTx;
 use crate::{shared::*, trace_log, MTx, NotCloneable, SenderType, Tx};
+use pin_project_lite::pin_project;
 use std::cell::Cell;
 use std::fmt;
 use std::future::Future;
@@ -365,19 +366,38 @@ where
     }
 }
 
-/// A fixed-sized future object constructed by [AsyncTx::send_timeout()]
-#[must_use]
-pub struct SendTimeoutFuture<'a, F, FR, R>
-where
-    F: Flavor,
-    FR: Future<Output = R>,
-{
-    tx: &'a AsyncTx<F>,
-    sleep: FR,
-    item: MaybeUninit<F::Item>,
-    waker: Option<<F::Send as Registry>::Waker>,
-    // Set once `item` has been moved out (sent or returned), so it is never read twice.
-    done: bool,
+pin_project! {
+    /// A fixed-sized future object constructed by [AsyncTx::send_timeout()]
+    #[must_use]
+    pub struct SendTimeoutFuture<'a, F, FR, R>
+    where
+        F: Flavor,
+        FR: Future<Output = R>,
+    {
+        tx: &'a AsyncTx<F>,
+        #[pin]
+        sleep: FR,
+        item: MaybeUninit<F::Item>,
+        waker: Option<<F::Send as Registry>::Waker>,
+        // Set once `item` has been moved out (sent or returned), so it is never read twice.
+        done: bool,
+    }
+
+    impl<F, FR, R> PinnedDrop for SendTimeoutFuture<'_, F, FR, R>
+    where
+        F: Flavor,
+        FR: Future<Output = R>,
+    {
+        fn drop(this: Pin<&mut Self>) {
+            let this = this.project();
+            if let Some(waker) = this.waker.as_ref() {
+                // Cancelling the future, poll is not ready
+                if this.tx.shared.abandon_send_waker(waker) && needs_drop::<F::Item>() {
+                    unsafe { this.item.assume_init_drop() };
+                }
+            }
+        }
+    }
 }
 
 unsafe impl<F, FR, R> Send for SendTimeoutFuture<'_, F, FR, R>
@@ -386,22 +406,6 @@ where
     FR: Future<Output = R> + Send,
     F::Item: Send,
 {
-}
-
-impl<F, FR, R> Drop for SendTimeoutFuture<'_, F, FR, R>
-where
-    F: Flavor,
-    FR: Future<Output = R>,
-{
-    #[inline]
-    fn drop(&mut self) {
-        if let Some(waker) = self.waker.as_ref() {
-            // Cancelling the future, poll is not ready
-            if self.tx.shared.abandon_send_waker(waker) && needs_drop::<F::Item>() {
-                unsafe { self.item.assume_init_drop() };
-            }
-        }
-    }
 }
 
 impl<F, FR, R> Future for SendTimeoutFuture<'_, F, FR, R>
@@ -414,30 +418,27 @@ where
 
     #[inline]
     fn poll(self: Pin<&mut Self>, ctx: &mut Context) -> Poll<Self::Output> {
-        // NOTE: we can use unchecked to bypass pin because we are not movig "sleep",
-        // neither it's exposed outside
-        let mut _self = unsafe { self.get_unchecked_mut() };
-        assert!(!_self.done, "SendTimeoutFuture polled after completion");
-        match _self.tx.poll_send::<false>(ctx, &_self.item, &mut _self.waker) {
+        let this = self.project();
+        assert!(!*this.done, "SendTimeoutFuture polled after completion");
+        match this.tx.poll_send::<false>(ctx, this.item, this.waker) {
             Poll::Ready(Ok(())) => {
-                debug_assert!(_self.waker.is_none());
-                _self.done = true;
+                debug_assert!(this.waker.is_none());
+                *this.done = true;
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Err(())) => {
-                let _ = _self.waker.take();
-                _self.done = true;
+                let _ = this.waker.take();
+                *this.done = true;
                 Poll::Ready(Err(SendTimeoutError::Disconnected(unsafe {
-                    _self.item.assume_init_read()
+                    this.item.assume_init_read()
                 })))
             }
             Poll::Pending => {
-                let sleep = unsafe { Pin::new_unchecked(&mut _self.sleep) };
-                if sleep.poll(ctx).is_ready() {
-                    _self.done = true;
-                    if _self.tx.shared.abandon_send_waker(&_self.waker.take().unwrap()) {
+                if this.sleep.poll(ctx).is_ready() {
+                    *this.done = true;
+                    if this.tx.shared.abandon_send_waker(&this.waker.take().unwrap()) {
                         return Poll::Ready(Err(SendTimeoutError::Timeout(unsafe {
-                            _self.item.assume_init_read()
+                            this.item.assume_init_read()
                         })));
                     } else {
                         // Message already sent in background (on_recv).

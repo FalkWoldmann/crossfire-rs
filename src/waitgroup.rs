@@ -134,6 +134,7 @@ use crate::backoff::Backoff;
 use crate::shared::{check_timeout, ThinWaker};
 #[allow(unused_imports)]
 use crate::{tokio_task_id, trace_log};
+use pin_project_lite::pin_project;
 pub use pointers::{Pointer, SmartPointer};
 use std::cell::UnsafeCell;
 use std::fmt;
@@ -343,7 +344,7 @@ impl<T> WaitGroup<T> {
         Self {
             // one ref owned by myself
             threshold: threshold + 1,
-            inner: unsafe { NonNull::new_unchecked(Box::into_raw(inner)) },
+            inner: NonNull::from(Box::leak(inner)),
         }
     }
 
@@ -584,7 +585,7 @@ impl<T> WaitGroupZero<T> {
     pub fn new(inner: T) -> Self {
         // need one ref to represent ownership
         let inner = Box::new(WaitGroupInner::new(inner, 1));
-        Self { inner: unsafe { NonNull::new_unchecked(Box::into_raw(inner)) } }
+        Self { inner: NonNull::from(Box::leak(inner)) }
     }
 
     #[inline(always)]
@@ -1240,23 +1241,27 @@ where
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, ctx: &mut Context) -> Poll<Self::Output> {
-        let this = unsafe { self.get_unchecked_mut() };
+        let this = self.get_mut();
         this.inner.poll_async(ctx, &mut this.waker, this.threshold)
     }
 }
 
-/// Wait until the ref count is below threshold, return `Ok(())`.
-/// If timeout happens returns `Err(())`
-#[must_use]
-pub struct WaitGroupTimeoutFuture<'a, T, FR, R>
-where
-    FR: Future<Output = R>,
-    T: Send + Unpin,
-{
-    inner: &'a WaitGroupInner<T>,
-    sleep: FR,
-    threshold: usize,
-    waker: Option<Waker>,
+pin_project! {
+    /// Wait until the ref count is below threshold, return `Ok(())`.
+    /// If timeout happens returns `Err(())`
+    #[must_use]
+    pub struct WaitGroupTimeoutFuture<'a, T, FR, R>
+    where
+        FR: Future<Output = R>,
+        T: Send,
+        T: Unpin,
+    {
+        inner: &'a WaitGroupInner<T>,
+        #[pin]
+        sleep: FR,
+        threshold: usize,
+        waker: Option<Waker>,
+    }
 }
 
 impl<'a, T, FR, R> Future for WaitGroupTimeoutFuture<'a, T, FR, R>
@@ -1267,12 +1272,11 @@ where
     type Output = Result<(), ()>;
 
     fn poll(self: Pin<&mut Self>, ctx: &mut Context) -> Poll<Self::Output> {
-        let this = unsafe { self.get_unchecked_mut() };
-        if this.inner.poll_async(ctx, &mut this.waker, this.threshold).is_ready() {
+        let this = self.project();
+        if this.inner.poll_async(ctx, this.waker, *this.threshold).is_ready() {
             return Poll::Ready(Ok(()));
         }
-        let sleep = unsafe { Pin::new_unchecked(&mut this.sleep) };
-        if sleep.poll(ctx).is_ready() {
+        if this.sleep.poll(ctx).is_ready() {
             Poll::Ready(Err(()))
         } else {
             Poll::Pending
@@ -1455,7 +1459,7 @@ mod tests {
         assert_eq!(s.waker_flag(), WAKER_FLAG_SET);
         assert_eq!(inner.count(SeqCst), 2);
 
-        let p = unsafe { NonNull::new_unchecked(Box::into_raw(inner)) };
+        let p = NonNull::from(Box::leak(inner));
         println!("test done triggering wakeup");
         unsafe {
             assert!(!WaitGroupInner::done_ptr(p, 1, 1));

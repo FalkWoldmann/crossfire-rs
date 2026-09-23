@@ -306,9 +306,10 @@ impl<F: Flavor> Multiplex<F> {
     #[inline(always)]
     fn _try_select_cached<const FINAL: bool>(&self) -> Result<F::Item, usize> {
         let last_idx = self.last_idx.get();
-        let handle = unsafe { self.handlers.get_unchecked(last_idx) };
         let count = self.count.get();
         let loop_count = if count > 0 {
+            // count > 0 only after a message was received from `last_idx`, so handlers is not empty
+            let handle = &self.handlers[last_idx];
             if let Some(msg) = handle.shared.inner.try_recv_cached() {
                 handle.shared.on_recv();
                 self.count.set(count - 1);
@@ -331,7 +332,7 @@ impl<F: Flavor> Multiplex<F> {
         let len = self.handlers.len();
         for _ in 0..loop_count {
             idx = if idx + 1 >= len { 0 } else { idx + 1 };
-            let handle = unsafe { self.handlers.get_unchecked(idx) };
+            let handle = &self.handlers[idx];
             if let Some(msg) = if FINAL {
                 handle.shared.inner.try_recv_final()
             } else {

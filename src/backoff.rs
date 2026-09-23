@@ -1,5 +1,4 @@
 use core::num::NonZero;
-use std::mem::transmute;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread;
 
@@ -66,13 +65,12 @@ impl BackoffConfig {
 
     #[inline(always)]
     pub const fn to_u32(self) -> u32 {
-        let i: u32 = unsafe { transmute(self) };
-        i
+        (self.spin_limit as u32) | ((self.limit as u32) << 16)
     }
 
     #[inline(always)]
     pub const fn from_u32(config: u32) -> Self {
-        unsafe { transmute(config) }
+        Self { spin_limit: config as u16, limit: (config >> 16) as u16 }
     }
 
     #[allow(dead_code)]

@@ -1,6 +1,7 @@
 use crate::*;
 use crossfire::flavor::{self, Queue};
 use crossfire::oneshot::{RxOneshot, TxOneshot};
+use crossfire::select::Multiplex;
 use crossfire::waitgroup::{WaitGroup, WaitGroupGuard, WaitGroupZero, WaitGroupZeroGuard};
 use crossfire::*;
 use std::cell::Cell;
@@ -13,6 +14,7 @@ use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
+use std::time::Duration;
 
 // Detect auto traits of concrete types: the inherent const only exists when the bound holds,
 // otherwise the trait's default const is used.
@@ -228,4 +230,13 @@ fn test_waitgroup_concurrent_wait_async() {
         });
         assert_eq!(wg.get_left_seqcst(), 0);
     }
+}
+
+#[test]
+fn test_multiplex_without_channel() {
+    // Receiving from a Multiplex with no channel added must not index into an empty list.
+    let mp = Multiplex::<mpsc::Array<usize>>::new();
+    assert_eq!(mp.try_recv(), Err(TryRecvError::Disconnected));
+    assert_eq!(mp.recv_timeout(Duration::from_millis(10)), Err(RecvTimeoutError::Disconnected));
+    assert_eq!(mp.recv(), Err(RecvError));
 }
