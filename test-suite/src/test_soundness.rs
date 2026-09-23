@@ -6,12 +6,13 @@ use crossfire::waitgroup::{WaitGroup, WaitGroupGuard, WaitGroupZero, WaitGroupZe
 use crossfire::*;
 use std::cell::Cell;
 use std::future::{pending, Future, Ready};
+use std::hint::spin_loop;
 use std::marker::PhantomData;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::pin::pin;
 use std::rc::Rc;
 use std::sync::atomic::AtomicU32;
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 use std::time::Duration;
@@ -180,22 +181,36 @@ fn test_send_future_poll_after_disconnect() {
     assert!(r.is_err(), "poll after Ready should panic");
 }
 
+/// Poll wait_async() once, so a waker is registered and the last guard drop takes the waker lock.
+fn register_waker<F: Future>(f: F) {
+    let waker = noop_waker();
+    let mut ctx = Context::from_waker(&waker);
+    assert!(pin!(f).poll(&mut ctx).is_pending());
+}
+
 #[test]
 fn test_waitgroup_into_inner_after_wait() {
-    // try_into_inner() / get_mut() must not race with a guard still waking the waiter.
+    // try_into_inner() / get_mut() must not free or alias the state while the dropping guard
+    // still holds the waker lock.
     for _ in 0..ROUND {
         let mut wg = WaitGroup::new(Box::new(1usize), 0);
         let guard = wg.add_guard();
+        register_waker(wg.wait_async());
         let th = thread::spawn(move || drop(guard));
-        wg.wait();
+        while wg.get_left_seqcst() > 0 {
+            spin_loop();
+        }
         **WaitGroup::get_mut(&mut wg).expect("get_mut") += 1;
         assert_eq!(*WaitGroup::try_into_inner(wg).expect("into_inner"), 2);
         th.join().expect("join");
 
         let wg = WaitGroupZero::new(Box::new(1usize));
         let guard = wg.add_guard();
+        register_waker(wg.wait_async());
         let th = thread::spawn(move || drop(guard));
-        wg.wait();
+        while wg.get_left_seqcst() > 0 {
+            spin_loop();
+        }
         assert_eq!(*WaitGroupZero::try_into_inner(wg).expect("into_inner"), 1);
         th.join().expect("join");
     }
@@ -204,30 +219,24 @@ fn test_waitgroup_into_inner_after_wait() {
 #[test]
 fn test_waitgroup_concurrent_wait_async() {
     // WaitGroup is !Sync, but its futures are Send, so two waiters may set the waker concurrently.
-    let round = ROUND / 10;
-    for _ in 0..round {
+    for _ in 0..ROUND {
         let wg = WaitGroup::new((), 0);
-        let guards: Vec<_> = (0..4).map(|_| wg.add_guard()).collect();
-        let f1 = wg.wait_async();
-        let f2 = wg.wait_async();
+        let guard = wg.add_guard();
+        let barrier = Barrier::new(2);
+        let (f1, f2) = (wg.wait_async(), wg.wait_async());
         thread::scope(|s| {
             for f in [f1, f2] {
+                let barrier = &barrier;
                 s.spawn(move || {
                     let waker = noop_waker();
                     let mut ctx = Context::from_waker(&waker);
                     let mut f = pin!(f);
-                    while f.as_mut().poll(&mut ctx).is_pending() {
-                        thread::yield_now();
-                    }
+                    barrier.wait();
+                    assert!(f.as_mut().poll(&mut ctx).is_pending());
                 });
             }
-            s.spawn(move || {
-                for g in guards {
-                    thread::yield_now();
-                    drop(g);
-                }
-            });
         });
+        drop(guard);
         assert_eq!(wg.get_left_seqcst(), 0);
     }
 }
