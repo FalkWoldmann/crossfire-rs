@@ -24,6 +24,28 @@ fn setup_log() {
 
 #[logfn]
 #[rstest]
+fn test_unbounded_request_response(setup_log: ()) {
+    // The receiver spin never finds a request here, so it stops spinning and later probes,
+    // replies must still arrive in order.
+    runtime_block_on!(async move {
+        let (tx, rx) = mpsc::unbounded_async::<(usize, oneshot::TxOneshot<usize>)>();
+        let server = async_spawn!(async move {
+            while let Ok((i, reply)) = rx.recv().await {
+                reply.send(i + 1);
+            }
+        });
+        for i in 0..ROUND {
+            let (reply_tx, reply_rx) = oneshot::oneshot();
+            tx.send((i, reply_tx)).expect("send");
+            assert_eq!(reply_rx.await.expect("reply"), i + 1);
+        }
+        drop(tx);
+        let _ = server.await;
+    });
+}
+
+#[logfn]
+#[rstest]
 fn test_basic_weak(setup_log: ()) {
     runtime_block_on!(async move {
         let (tx, rx) = mpsc::unbounded_async::<usize>();

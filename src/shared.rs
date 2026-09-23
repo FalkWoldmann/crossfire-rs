@@ -17,6 +17,7 @@ pub struct ChannelShared<F: Flavor> {
     pub(crate) recvs: F::Recv,
     pub(crate) backoff_limit: u16,
     pub(crate) large: bool,
+    pub(crate) rx_spin: AdaptiveSpin,
 }
 
 impl<F: Flavor> ChannelShared<F> {
@@ -34,6 +35,7 @@ impl<F: Flavor> ChannelShared<F> {
             recvs,
             backoff_limit: inner.backoff_limit(),
             large,
+            rx_spin: AdaptiveSpin::new(),
             inner,
         })
     }
@@ -303,6 +305,29 @@ impl<F: Flavor> ChannelShared<F> {
         }
         // It's effective to yield for size=1
         Some(Backoff::from(cfg.limit(self.backoff_limit)))
+    }
+
+    /// Only adapt the receiver spin of unbounded channels: senders there never wait for space, so
+    /// whether the spin finds a message depends on the producer alone. On bounded channels each
+    /// side's spin only pays off while the other side spins too, so backing off on one side
+    /// can drive both into parking on every message.
+    #[inline(always)]
+    pub(crate) fn get_async_recv_backoff(&self) -> Option<Backoff> {
+        if !F::IS_BOUNDED && !self.rx_spin.should_spin() {
+            return None;
+        }
+        self.get_async_backoff()
+    }
+
+    #[inline(always)]
+    pub(crate) fn on_recv_spin(&self, hit: bool) {
+        if !F::IS_BOUNDED {
+            if hit {
+                self.rx_spin.hit();
+            } else {
+                self.rx_spin.miss();
+            }
+        }
     }
 }
 

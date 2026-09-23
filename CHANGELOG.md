@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Async receivers of unbounded channels stop spinning before parking while the spin keeps finding no message, and probe to resume. Request/response over an unbounded channel no longer waits out the full spin each time.
 - Channel constructors and flavors require `T: Send`, `flavor::*` queues are only `Send`/`Sync` when `T: Send`.
 - `flavor::ArraySpsc`, `ArrayMpsc`, `OneSpsc`, `OneMpsc` are no longer `Sync`, their `Queue::push()`/`pop()` assume a single producer or consumer.
 - `WaitGroup`, `WaitGroupZero` and their guards require `T: Send + Sync` to be `Send`/`Sync`.

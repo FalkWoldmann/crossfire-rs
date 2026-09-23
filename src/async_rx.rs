@@ -280,14 +280,18 @@ impl<F: Flavor> AsyncRx<F> {
             if o_waker.is_none() {
                 try_recv!(try_recv=>{ on_recv_no_waker!()});
                 // First call
-                if let Some(mut backoff) = shared.get_async_backoff() {
+                if let Some(mut backoff) = shared.get_async_recv_backoff() {
                     loop {
                         let complete = backoff.spin();
-                        try_recv!(try_recv=>{ on_recv_no_waker!()});
+                        try_recv!(try_recv=>{
+                            shared.on_recv_spin(true);
+                            on_recv_no_waker!()
+                        });
                         if complete {
                             break;
                         }
                     }
+                    shared.on_recv_spin(false);
                 }
             } else {
                 try_recv!(try_recv => {on_recv_waker!(WakerState::Woken)});

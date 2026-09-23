@@ -100,6 +100,58 @@ impl BackoffConfig {
     }
 }
 
+/// Adapts the async spin-before-park to whether spinning pays off on this channel.
+///
+/// Spinning pays off when the counterpart runs concurrently and refills (or drains) the channel
+/// within the spin, as in streaming. It is pure delay for request/response, or on a
+/// single-threaded runtime, where the counterpart cannot progress until this task yields.
+///
+/// A miss costs one spin (about 2us), a hit saves a park and wake-up (tens of us), so spinning is
+/// worth it even when only a few percent of spins hit. The high half holds a score: a hit adds
+/// `HIT_SCORE`, a miss subtracts 1, and spinning stops at 0, i.e. once the hit rate stays below
+/// about 1 / (HIT_SCORE + 1). While stopped, the low half counts attempts and every
+/// `PROBE_INTERVAL`-th attempt spins anyway, so spinning resumes once it pays off again.
+pub struct AdaptiveSpin(AtomicU32);
+
+const HIT_SCORE: u32 = 32;
+const INIT_SCORE: u32 = 64;
+const MAX_SCORE: u32 = 256;
+const PROBE_INTERVAL: u32 = 32;
+
+impl AdaptiveSpin {
+    #[inline]
+    pub const fn new() -> Self {
+        Self(AtomicU32::new(INIT_SCORE << 16))
+    }
+
+    #[inline(always)]
+    pub fn should_spin(&self) -> bool {
+        let v = self.0.load(Ordering::Relaxed);
+        if v >> 16 > 0 {
+            return true;
+        }
+        let count = (v + 1) & 0xffff;
+        self.0.store(count, Ordering::Relaxed);
+        count % PROBE_INTERVAL == 0
+    }
+
+    #[inline(always)]
+    pub fn hit(&self) {
+        let score = self.0.load(Ordering::Relaxed) >> 16;
+        if score < MAX_SCORE {
+            self.0.store((score + HIT_SCORE).min(MAX_SCORE) << 16, Ordering::Relaxed);
+        }
+    }
+
+    #[inline(always)]
+    pub fn miss(&self) {
+        let score = self.0.load(Ordering::Relaxed) >> 16;
+        if score > 0 {
+            self.0.store((score - 1) << 16, Ordering::Relaxed);
+        }
+    }
+}
+
 pub struct Backoff {
     step: u16,
     pub config: BackoffConfig,
@@ -183,6 +235,35 @@ impl Backoff {
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn test_adaptive_spin() {
+        let spin = AdaptiveSpin::new();
+        for _ in 0..INIT_SCORE {
+            assert!(spin.should_spin());
+            spin.miss();
+        }
+        // Stopped, but probes every PROBE_INTERVAL attempts
+        let probes = (0..PROBE_INTERVAL * 4).filter(|_| spin.should_spin()).count();
+        assert_eq!(probes, 4);
+        spin.miss();
+        assert!(!spin.should_spin());
+        // A hit rate above 1 / (HIT_SCORE + 1) keeps spinning, and raises the score to the cap
+        spin.hit();
+        for _ in 0..MAX_SCORE {
+            for _ in 0..HIT_SCORE - 1 {
+                assert!(spin.should_spin());
+                spin.miss();
+            }
+            spin.hit();
+        }
+        // The score is capped, so a switch to request/response stops spinning in bounded time
+        for _ in 0..MAX_SCORE {
+            assert!(spin.should_spin());
+            spin.miss();
+        }
+        assert!(!spin.should_spin());
+    }
 
     #[test]
     fn test_backoff() {
