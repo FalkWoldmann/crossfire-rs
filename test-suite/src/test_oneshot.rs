@@ -3,6 +3,11 @@ use captains_log::logfn;
 use crossfire::*;
 use fastrand;
 use rstest::*;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::task::{Context, Wake, Waker};
 use std::thread;
 use std::time::Duration;
 
@@ -445,4 +450,162 @@ fn test_oneshot_async_timeout_success(setup_log: ()) {
         assert_eq!(_res, Ok(42));
         async_join_result!(th);
     });
+}
+
+struct CountWaker(AtomicUsize);
+
+impl Wake for CountWaker {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn count_waker() -> (Arc<CountWaker>, Waker) {
+    let w = Arc::new(CountWaker(AtomicUsize::new(0)));
+    (w.clone(), Waker::from(w))
+}
+
+fn woken(w: &CountWaker) -> usize {
+    w.0.load(Ordering::SeqCst)
+}
+
+#[logfn]
+#[rstest]
+fn test_oneshot_poll_closed(setup_log: ()) {
+    let (counter, waker) = count_waker();
+    let mut ctx = Context::from_waker(&waker);
+    let item = Arc::new(());
+
+    // rx dropped before polling
+    let (mut tx, rx) = oneshot::oneshot::<Arc<()>>();
+    drop(rx);
+    assert!(tx.poll_closed(&mut ctx).is_ready());
+    tx.send(item.clone());
+    assert_eq!(Arc::strong_count(&item), 1);
+
+    // rx dropped while registered, then tx sends
+    let (mut tx, rx) = oneshot::oneshot::<Arc<()>>();
+    assert!(tx.poll_closed(&mut ctx).is_pending());
+    assert!(tx.poll_closed(&mut ctx).is_pending());
+    assert_eq!(woken(&counter), 0);
+    drop(rx);
+    assert_eq!(woken(&counter), 1);
+    assert!(tx.poll_closed(&mut ctx).is_ready());
+    tx.send(item.clone());
+    assert_eq!(Arc::strong_count(&item), 1);
+
+    // Only the latest waker is woken
+    let (counter2, waker2) = count_waker();
+    let (mut tx, rx) = oneshot::oneshot::<Arc<()>>();
+    assert!(tx.poll_closed(&mut ctx).is_pending());
+    assert!(tx.poll_closed(&mut Context::from_waker(&waker2)).is_pending());
+    drop(rx);
+    assert_eq!(woken(&counter), 1);
+    assert_eq!(woken(&counter2), 1);
+    drop(tx);
+
+    // Registered, then sends normally
+    let (mut tx, rx) = oneshot::oneshot::<Arc<()>>();
+    assert!(tx.poll_closed(&mut ctx).is_pending());
+    tx.send(item.clone());
+    assert_eq!(Arc::strong_count(&item), 2);
+    drop(rx.recv().expect("recv"));
+    assert_eq!(Arc::strong_count(&item), 1);
+
+    // Registered, then drops
+    let (mut tx, rx) = oneshot::oneshot::<Arc<()>>();
+    assert!(tx.poll_closed(&mut ctx).is_pending());
+    drop(tx);
+    assert_eq!(rx.recv(), Err(RecvError));
+    assert_eq!(woken(&counter), 1);
+
+    // rx gives up on timeout
+    let (mut tx, rx) = oneshot::oneshot::<Arc<()>>();
+    assert!(tx.poll_closed(&mut ctx).is_pending());
+    assert_eq!(rx.recv_timeout(Duration::from_millis(1)), Err(RecvTimeoutError::Timeout));
+    assert_eq!(woken(&counter), 2);
+    assert!(tx.poll_closed(&mut ctx).is_ready());
+    tx.send(item.clone());
+    assert_eq!(Arc::strong_count(&item), 1);
+
+    // rx future polled then cancelled
+    let (mut tx, mut rx) = oneshot::oneshot::<Arc<()>>();
+    assert!(tx.poll_closed(&mut ctx).is_pending());
+    assert!(Pin::new(&mut rx).poll(&mut ctx).is_pending());
+    drop(rx);
+    assert_eq!(woken(&counter), 3);
+    assert!(tx.poll_closed(&mut ctx).is_ready());
+    drop(tx);
+}
+
+#[logfn]
+#[rstest]
+fn test_oneshot_closed_async(setup_log: ()) {
+    runtime_block_on!(async move {
+        let (mut tx, rx) = oneshot::oneshot::<usize>();
+        let th = async_spawn!(async move {
+            sleep(Duration::from_millis(10)).await;
+            drop(rx);
+        });
+        tx.closed().await;
+        assert!(tx.is_disconnected());
+        let _ = th.await;
+    });
+}
+
+#[logfn]
+#[rstest]
+fn test_oneshot_poll_closed_concurrent(setup_log: ()) {
+    // The last of tx and rx frees the channel, while rx may be waking tx's waker.
+    let item = Arc::new(());
+    for i in 0..ROUND {
+        let (mut tx, rx) = oneshot::oneshot::<Arc<()>>();
+        let value = item.clone();
+        let th = thread::spawn(move || {
+            let (_counter, waker) = count_waker();
+            let mut ctx = Context::from_waker(&waker);
+            let _ = tx.poll_closed(&mut ctx);
+            match i % 3 {
+                0 => tx.send(value),
+                1 => drop(tx),
+                _ => {
+                    // Alternate wakers, so tx replaces its waker while rx may be closing
+                    let (_counter2, waker2) = count_waker();
+                    let mut ctx2 = Context::from_waker(&waker2);
+                    loop {
+                        if tx.poll_closed(&mut ctx2).is_ready()
+                            || tx.poll_closed(&mut ctx).is_ready()
+                        {
+                            break;
+                        }
+                        thread::yield_now();
+                    }
+                    tx.send(value);
+                }
+            }
+        });
+        match i % 4 {
+            0 => drop(rx),
+            1 => drop(rx.recv_timeout(Duration::from_micros(1))),
+            2 => {
+                let (_counter, waker) = count_waker();
+                let mut rx = rx;
+                let _ = Pin::new(&mut rx).poll(&mut Context::from_waker(&waker));
+                drop(rx);
+            }
+            _ => {
+                if i % 3 == 2 {
+                    drop(rx);
+                } else {
+                    drop(rx.recv());
+                }
+            }
+        }
+        th.join().expect("join");
+    }
+    assert_eq!(Arc::strong_count(&item), 1);
 }

@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `TxOneshot::poll_closed()` / `closed()`: wait until the `RxOneshot` is dropped or gives up.
+
 ### Removed
 
 ### Changed
@@ -28,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Soundness: `WaitGroup(Zero)::try_into_inner()`/`get_mut()` could free or alias the shared state while a guard was still waking the waiter.
 - Soundness: two `WaitGroup::wait_async()` futures polled on different threads raced on the waker slot.
 - Soundness: `Multiplex::recv()` / `recv_timeout()` without any channel indexed an empty list.
+- Soundness: `RxOneshot::poll()` and the sender could both hold `&mut` to the receiver waker at once.
 
 ## [3.1.20] - 2026-09-05
 

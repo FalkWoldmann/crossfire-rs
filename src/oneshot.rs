@@ -43,14 +43,14 @@ use crate::shared::*;
 use crate::{tokio_task_id, trace_log};
 use core::cell::UnsafeCell;
 use pin_project_lite::pin_project;
-use std::future::Future;
+use std::future::{poll_fn, Future};
 use std::pin::Pin;
 use std::ptr::NonNull;
 use std::sync::atomic::{
     fence, AtomicU8,
     Ordering::{self, AcqRel, Acquire, SeqCst},
 };
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -61,11 +61,18 @@ const WAKER_SET_FLAG: u8 = 0x2;
 /// set by any of TxOneshot/RxOneshot if it exit
 const CLOSE_FLAG: u8 = 0x4;
 const EXIST_FLAG: u8 = 0x8;
+/// set by TxOneshot::poll_closed() while `tx_waker` holds its waker, only the sender writes
+/// `tx_waker`, and only while this flag is clear and CLOSE_FLAG is not set.
+const TX_WAKER_FLAG: u8 = 0x10;
+/// set by RxOneshot together with CLOSE_FLAG while it wakes `tx_waker`,
+/// the sender must not free the inner meanwhile.
+const RX_WAKING_FLAG: u8 = 0x20;
 
 struct OneShotInner<T> {
     state: AtomicU8,
     value: UnsafeCell<Option<T>>,
     o_waker: UnsafeCell<Option<ThinWaker>>,
+    tx_waker: UnsafeCell<Option<Waker>>,
 }
 
 unsafe impl<T: Send> Send for OneShotInner<T> {}
@@ -78,22 +85,37 @@ impl<T> OneShotInner<T> {
             value: UnsafeCell::new(None),
             state: AtomicU8::new(0),
             o_waker: UnsafeCell::new(None),
+            tx_waker: UnsafeCell::new(None),
         })
     }
 
+    /// Both sides may read the receiver waker concurrently, the receiver writes it only while
+    /// WAKER_SET_FLAG is clear, when the sender does not read it.
     #[inline]
-    fn get_waker(&self) -> &mut Option<ThinWaker> {
+    fn get_waker(&self) -> &Option<ThinWaker> {
+        unsafe { &*self.o_waker.get() }
+    }
+
+    #[inline]
+    #[allow(clippy::mut_from_ref)]
+    fn get_waker_mut(&self) -> &mut Option<ThinWaker> {
         unsafe { &mut *self.o_waker.get() }
+    }
+
+    #[inline]
+    fn tx_waker(&self) -> &Option<Waker> {
+        unsafe { &*self.tx_waker.get() }
+    }
+
+    #[inline]
+    #[allow(clippy::mut_from_ref)]
+    fn tx_waker_mut(&self) -> &mut Option<Waker> {
+        unsafe { &mut *self.tx_waker.get() }
     }
 
     #[inline(always)]
     fn value_mut(&self) -> &mut Option<T> {
         unsafe { &mut *self.value.get() }
-    }
-
-    #[inline(always)]
-    fn set_state(&self, flag: u8) -> u8 {
-        self.state.fetch_or(flag, Ordering::AcqRel)
     }
 
     #[inline(always)]
@@ -155,20 +177,37 @@ impl<T> OneShotInner<T> {
         let mut old_state = 0;
         let exist_flag: u8 = if exist { EXIST_FLAG } else { 0 };
         loop {
-            let new_state = if old_state == 0 {
-                LOCK_FLAG | CLOSE_FLAG | exist_flag
-            } else if old_state == WAKER_SET_FLAG {
-                LOCK_FLAG | WAKER_SET_FLAG | exist_flag
-            } else if old_state & CLOSE_FLAG > 0 {
+            if old_state & CLOSE_FLAG > 0 {
+                if old_state & RX_WAKING_FLAG > 0 {
+                    // rx is waking our poll_closed() waker, leave the cleanup to it
+                    match this.state.compare_exchange_weak(
+                        old_state,
+                        old_state | LOCK_FLAG,
+                        AcqRel,
+                        Acquire,
+                    ) {
+                        Ok(_) => return false,
+                        Err(s) => {
+                            old_state = s;
+                            continue;
+                        }
+                    }
+                }
                 // WAKER_SET_FLAG | CLOSE_FLAG, or just CLOSE_FLAG
                 trace_log!("oneshot:({:?}) rx closed", tokio_task_id!());
                 return true;
+            }
+            let rx_state = old_state & !TX_WAKER_FLAG;
+            let new_state = if rx_state == 0 {
+                old_state | LOCK_FLAG | CLOSE_FLAG | exist_flag
+            } else if rx_state == WAKER_SET_FLAG {
+                old_state | LOCK_FLAG | exist_flag
             } else {
                 panic!("unexpected state {}", old_state);
             };
             match this.state.compare_exchange_weak(old_state, new_state, AcqRel, Acquire) {
                 Ok(_) => {
-                    if old_state == 0 {
+                    if rx_state == 0 {
                         trace_log!("oneshot:({:?}) send value", tokio_task_id!());
                         return false;
                     } else {
@@ -180,9 +219,11 @@ impl<T> OneShotInner<T> {
                         } else {
                             unreachable!();
                         }
+                        // rx does not set RX_WAKING_FLAG once LOCK_FLAG is set, so a failure
+                        // here means rx closed.
                         if let Err(state) = this.state.compare_exchange(
                             new_state,
-                            CLOSE_FLAG | LOCK_FLAG | exist_flag,
+                            (new_state & !WAKER_SET_FLAG) | CLOSE_FLAG,
                             AcqRel,
                             Acquire,
                         ) {
@@ -205,26 +246,96 @@ impl<T> OneShotInner<T> {
         }
     }
 
+    /// Close from the receiver side. If the sender is still alive and waits in poll_closed(),
+    /// wake it.
+    ///
+    /// Return true when the sender is already done, so the caller must free the inner.
+    #[inline(always)]
+    fn _rx_close(p: NonNull<Self>) -> bool {
+        let this = unsafe { p.as_ref() };
+        let mut state = this.state.load(Acquire);
+        loop {
+            let wake_tx = Self::_tx_waiting(state);
+            let new_state = state | CLOSE_FLAG | if wake_tx { RX_WAKING_FLAG } else { 0 };
+            match this.state.compare_exchange_weak(state, new_state, AcqRel, Acquire) {
+                Ok(_) => {
+                    if state & CLOSE_FLAG > 0 {
+                        // tx closed first
+                        return true;
+                    }
+                    return wake_tx && Self::_wake_tx(p);
+                }
+                Err(s) => state = s,
+            }
+        }
+    }
+
+    /// Whether the sender has not sent nor dropped, and has a poll_closed() waker.
+    #[inline(always)]
+    fn _tx_waiting(state: u8) -> bool {
+        state & (LOCK_FLAG | CLOSE_FLAG) == 0 && state & TX_WAKER_FLAG > 0
+    }
+
+    /// Called by rx after setting CLOSE_FLAG | RX_WAKING_FLAG.
+    ///
+    /// Return true when the sender finished meanwhile, so the caller must free the inner.
+    #[inline(always)]
+    fn _wake_tx(p: NonNull<Self>) -> bool {
+        let this = unsafe { p.as_ref() };
+        // The sender only reads tx_waker once CLOSE_FLAG is set, and RX_WAKING_FLAG keeps it
+        // from freeing the inner.
+        if let Some(waker) = this.tx_waker().as_ref() {
+            waker.wake_by_ref();
+        }
+        let old = this.state.fetch_and(!RX_WAKING_FLAG, AcqRel);
+        old & LOCK_FLAG > 0
+    }
+
     #[inline(always)]
     fn set_waker(&self, waker: ThinWaker) -> Result<(), u8> {
         // thread context only need set waker once.
         // NOTE we should guarantee waker not set twice
         // (the recv_timeout API should not allow recv twice),
         // it will complicate things (like async poll).
-        self.get_waker().replace(waker);
-        self.state.compare_exchange(0, WAKER_SET_FLAG, AcqRel, Acquire)?;
-        Ok(())
+        self.get_waker_mut().replace(waker);
+        let mut state = 0;
+        loop {
+            match self.state.compare_exchange(state, state | WAKER_SET_FLAG, AcqRel, Acquire) {
+                Ok(_) => return Ok(()),
+                Err(s) => {
+                    if s & !TX_WAKER_FLAG != 0 {
+                        return Err(s);
+                    }
+                    state = s;
+                }
+            }
+        }
     }
 
+    /// With `abandon`, rx gives up and closes.
+    ///
+    /// Return Ok(true) when the caller must free the inner.
     #[inline(always)]
-    fn cancel_waker(&self, abandon: bool) -> Result<(), u8> {
-        let new_state = if abandon { CLOSE_FLAG } else { 0 };
-        if let Err(state) = self.state.compare_exchange(WAKER_SET_FLAG, new_state, AcqRel, Acquire)
-        {
-            // expect LOCK_FLAG | CLOSE_FLAG, or LOCK_FLAG | WAKER_SET_FLAG
-            return Err(state);
-        } else {
-            Ok(())
+    fn cancel_waker(p: NonNull<Self>, abandon: bool) -> Result<bool, u8> {
+        let this = unsafe { p.as_ref() };
+        let mut state = this.state.load(Acquire);
+        loop {
+            if state & !TX_WAKER_FLAG != WAKER_SET_FLAG {
+                // expect LOCK_FLAG | CLOSE_FLAG, or LOCK_FLAG | WAKER_SET_FLAG
+                return Err(state);
+            }
+            let wake_tx = abandon && Self::_tx_waiting(state);
+            let mut new_state = state & !WAKER_SET_FLAG;
+            if abandon {
+                new_state |= CLOSE_FLAG;
+            }
+            if wake_tx {
+                new_state |= RX_WAKING_FLAG;
+            }
+            match this.state.compare_exchange(state, new_state, AcqRel, Acquire) {
+                Ok(_) => return Ok(wake_tx && Self::_wake_tx(p)),
+                Err(s) => state = s,
+            }
         }
     }
 
@@ -262,6 +373,56 @@ impl<T> TxOneshot<T> {
     pub fn is_disconnected(&self) -> bool {
         unsafe { self.0.as_ref() }.state.load(Acquire) & CLOSE_FLAG > 0
     }
+
+    /// Poll whether the [RxOneshot] is dropped (or gave up waiting), registering the task to
+    /// be woken when it is.
+    ///
+    /// Only the waker of the most recent call is woken.
+    pub fn poll_closed(&mut self, ctx: &mut Context) -> Poll<()> {
+        let inner = unsafe { self.0.as_ref() };
+        let mut state = inner.state.load(Acquire);
+        if state & CLOSE_FLAG > 0 {
+            return Poll::Ready(());
+        }
+        if state & TX_WAKER_FLAG > 0 {
+            // rx only reads tx_waker, so reading it while the flag is set is fine.
+            if inner.tx_waker().as_ref().is_some_and(|w| w.will_wake(ctx.waker())) {
+                return Poll::Pending;
+            }
+            // Clear the flag to take tx_waker back before replacing it,
+            // this fails once rx closed and may be reading it.
+            loop {
+                match inner.state.compare_exchange_weak(
+                    state,
+                    state & !TX_WAKER_FLAG,
+                    AcqRel,
+                    Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(s) => {
+                        if s & CLOSE_FLAG > 0 {
+                            return Poll::Ready(());
+                        }
+                        state = s;
+                    }
+                }
+            }
+        }
+        // rx does not read tx_waker while TX_WAKER_FLAG is clear
+        inner.tx_waker_mut().replace(ctx.waker().clone());
+        if inner.state.fetch_or(TX_WAKER_FLAG, AcqRel) & CLOSE_FLAG > 0 {
+            // rx closed before seeing the flag, and will not wake us
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+
+    /// Wait until the [RxOneshot] is dropped (or gave up waiting).
+    #[inline]
+    pub async fn closed(&mut self) {
+        poll_fn(|ctx| self.poll_closed(ctx)).await
+    }
 }
 
 impl<T> Drop for TxOneshot<T> {
@@ -283,29 +444,13 @@ unsafe impl<T: Send> Send for RxOneshot<T> {}
 impl<T> Drop for RxOneshot<T> {
     #[inline]
     fn drop(&mut self) {
-        if let Some(p) = self.0.as_ref() {
-            let inner = unsafe { p.as_ref() };
-            let old_state = inner.set_state(CLOSE_FLAG);
-            if old_state & CLOSE_FLAG > 0 {
-                trace_log!("oneshot:({:?}) rx drop destroy, state={}", tokio_task_id!(), old_state);
-                debug_assert_eq!(
-                    old_state & (!EXIST_FLAG),
-                    CLOSE_FLAG | LOCK_FLAG,
-                    "unexpected state {old_state}"
-                ); // tx drop
-                   // drop inner
+        if let Some(p) = self.0 {
+            if OneShotInner::_rx_close(p) {
+                trace_log!("oneshot:({:?}) rx drop destroy", tokio_task_id!());
                 let _ = unsafe { Box::from_raw(p.as_ptr()) };
             } else {
                 // let tx do the cleanup
-                trace_log!("oneshot:({:?}) rx drop, state={}", tokio_task_id!(), old_state);
-                debug_assert!(
-                    old_state == 0 // we drop first, tx not trigger
-                        || old_state == WAKER_SET_FLAG // rx.await cancel, or rx.recv_timeout() timeout
-                        || old_state | EXIST_FLAG== (EXIST_FLAG | LOCK_FLAG | WAKER_SET_FLAG), // tx waking while rx.await cancel, or rx.recv_timeout() timeout
-                    "oneshot:({:?}) rx drop, unexpected state={}",
-                    tokio_task_id!(),
-                    old_state
-                );
+                trace_log!("oneshot:({:?}) rx drop", tokio_task_id!());
             }
         }
     }
@@ -402,7 +547,7 @@ impl<T> RxOneshot<T> {
                 trace_log!("oneshot:({:?}) spurious waked state {}", tokio_task_id!(), state,);
                 return Poll::Pending;
             }
-            if let Err(state) = inner.cancel_waker(false) {
+            if let Err(state) = OneShotInner::cancel_waker(p, false) {
                 process!(state);
             }
         }
@@ -462,13 +607,20 @@ impl<T> RxOneshot<T> {
                 }
                 Err(_) => {
                     trace_log!("oneshot: to cancel_waker on timeout");
-                    if let Err(state) = inner.cancel_waker(true) {
-                        process!(state);
-                    } else {
-                        let _ = inner;
-                        // we close first
-                        std::mem::forget(self);
-                        return Err(true);
+                    match OneShotInner::cancel_waker(p, true) {
+                        Err(state) => {
+                            process!(state);
+                        }
+                        Ok(destroy) => {
+                            let _ = inner;
+                            std::mem::forget(self);
+                            if destroy {
+                                // tx finished while we woke its poll_closed() waker
+                                let _ = unsafe { Box::from_raw(p.as_ptr()) };
+                            }
+                            // otherwise we close first, tx does the cleanup
+                            return Err(true);
+                        }
                     }
                 }
             }
