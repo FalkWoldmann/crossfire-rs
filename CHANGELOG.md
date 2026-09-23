@@ -13,7 +13,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Channel constructors and flavors require `T: Send`, `flavor::*` queues are only `Send`/`Sync` when `T: Send`.
+- `flavor::ArraySpsc`, `ArrayMpsc`, `OneSpsc`, `OneMpsc` are no longer `Sync`, their `Queue::push()`/`pop()` assume a single producer or consumer.
+- `WaitGroup`, `WaitGroupZero` and their guards require `T: Send + Sync` to be `Send`/`Sync`.
+- `send_with_timer()`/`recv_with_timer()` in `AsyncTxTrait`/`AsyncRxTrait` require the timer future to be `Send`.
+
 ### Fixed
+
+- Soundness: `TxOneshot`/`RxOneshot` and channels were `Send` for `!Send` messages.
+- Soundness: polling `SendFuture`/`SendTimeoutFuture` again after `Ready` sent or returned the message twice (double free), now panics.
+- Soundness: `SendTimeoutFuture`/`RecvTimeoutFuture` were `Send` with a `!Send` timer.
+- Soundness: `WaitGroup(Zero)::try_into_inner()`/`get_mut()` could free or alias the shared state while a guard was still waking the waiter.
+- Soundness: two `WaitGroup::wait_async()` futures polled on different threads raced on the waker slot.
 
 ## [3.1.20] - 2026-09-05
 

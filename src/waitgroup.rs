@@ -139,7 +139,6 @@ use std::cell::UnsafeCell;
 use std::fmt;
 use std::future::Future;
 use std::mem::offset_of;
-use std::mem::transmute;
 use std::ops::Deref;
 use std::pin::Pin;
 use std::ptr::NonNull;
@@ -334,7 +333,7 @@ pub struct WaitGroup<T> {
     // Remove the Sync marker to prevent concurrent waiting
 }
 
-unsafe impl<T: Send> Send for WaitGroup<T> {}
+unsafe impl<T: Send + Sync> Send for WaitGroup<T> {}
 
 impl<T> WaitGroup<T> {
     #[inline(always)]
@@ -494,7 +493,7 @@ impl<T> WaitGroup<T> {
     /// ganrantee return Ok
     #[inline]
     pub fn try_into_inner(this: Self) -> Result<T, Self> {
-        if this.get_left_seqcst() == 0 {
+        if this.get_inner().count_unlocked() == 1 {
             let inner = unsafe { Box::from_raw(this.inner.as_ptr()) };
             core::mem::forget(this);
             Ok(inner.inner)
@@ -512,8 +511,9 @@ impl<T> WaitGroup<T> {
     /// Calling this function after a `wait()` / `wait_async()` return with zero threshold,
     /// ganrantee return non-None result
     pub fn get_mut(this: &mut Self) -> Option<&mut T> {
-        if this.get_left_seqcst() == 0 {
-            Some(unsafe { &mut this.inner.as_mut().inner })
+        if this.get_inner().count_unlocked() == 1 {
+            // Project to `inner` through the raw pointer, so no `&mut` covers `state`/`o_waker`.
+            Some(unsafe { &mut (*this.inner.as_ptr()).inner })
         } else {
             None
         }
@@ -577,7 +577,7 @@ pub struct WaitGroupZero<T> {
     // Remove the Sync marker to prevent concurrent waiting
 }
 
-unsafe impl<T: Send> Send for WaitGroupZero<T> {}
+unsafe impl<T: Send + Sync> Send for WaitGroupZero<T> {}
 
 impl<T> WaitGroupZero<T> {
     #[inline(always)]
@@ -725,7 +725,7 @@ impl<T> WaitGroupZero<T> {
     /// ganrantee return Ok
     #[inline]
     pub fn try_into_inner(this: Self) -> Result<T, Self> {
-        if this.get_left_seqcst() == 0 {
+        if this.get_inner().count_unlocked() == 1 {
             let inner = unsafe { Box::from_raw(this.inner.as_ptr()) };
             core::mem::forget(this);
             Ok(inner.inner)
@@ -744,8 +744,9 @@ impl<T> WaitGroupZero<T> {
     /// ganrantee return non-None result
     #[inline]
     pub fn get_mut(this: &mut Self) -> Option<&mut T> {
-        if this.get_left_seqcst() == 0 {
-            Some(unsafe { &mut this.inner.as_mut().inner })
+        if this.get_inner().count_unlocked() == 1 {
+            // Project to `inner` through the raw pointer, so no `&mut` covers `state`/`o_waker`.
+            Some(unsafe { &mut (*this.inner.as_ptr()).inner })
         } else {
             None
         }
@@ -834,8 +835,8 @@ pub struct WaitGroupGuard<T> {
     threshold: usize,
 }
 
-unsafe impl<T: Send> Send for WaitGroupGuard<T> {}
-unsafe impl<T: Sync> Sync for WaitGroupGuard<T> {}
+unsafe impl<T: Send + Sync> Send for WaitGroupGuard<T> {}
+unsafe impl<T: Send + Sync> Sync for WaitGroupGuard<T> {}
 
 impl<T> Drop for WaitGroupGuard<T> {
     #[inline(always)]
@@ -887,8 +888,8 @@ pub struct WaitGroupZeroGuard<T> {
     inner: NonNull<WaitGroupInner<T>>,
 }
 
-unsafe impl<T: Send> Send for WaitGroupZeroGuard<T> {}
-unsafe impl<T: Sync> Sync for WaitGroupZeroGuard<T> {}
+unsafe impl<T: Send + Sync> Send for WaitGroupZeroGuard<T> {}
+unsafe impl<T: Send + Sync> Sync for WaitGroupZeroGuard<T> {}
 
 impl<T> Drop for WaitGroupZeroGuard<T> {
     #[inline(always)]
@@ -979,9 +980,26 @@ impl<T> WaitGroupInner<T> {
         self.state.load(order) & COUNT_MASK
     }
 
+    /// Return the count once no guard holds WAKER_FLAG_LOCK.
+    ///
+    /// A guard decreases the count and takes the lock in one CAS, then still accesses `o_waker`
+    /// and `state` until it releases the lock, so the count alone does not prove it is finished.
+    #[inline]
+    fn count_unlocked(&self) -> usize {
+        let mut backoff = Backoff::new();
+        loop {
+            let s = State::new(self.state.load(SeqCst));
+            if !s.is_locked() {
+                return s.count();
+            }
+            backoff.spin();
+        }
+    }
+
+    /// Caller must hold WAKER_FLAG_LOCK, or otherwise have exclusive access to `o_waker`.
     #[inline(always)]
     fn get_waker(&self) -> &mut Option<ThinWaker> {
-        unsafe { transmute(self.o_waker.get()) }
+        unsafe { &mut *self.o_waker.get() }
     }
 
     #[inline]
@@ -1108,27 +1126,20 @@ impl<T> WaitGroupInner<T> {
                 trace_log!("wg:({:?}) set_waker try again", tokio_task_id!());
                 continue;
             }
-            let old_state = if s.has_waker() {
-                if may_skip {
-                    trace_log!("wg:({:?}) set_waker skip", tokio_task_id!());
-                    return Ok(());
-                }
-                // waker exist, first try lock, then replace
-                if let Err(s) =
-                    self.state.compare_exchange_weak(state, s.try_lock(), SeqCst, Acquire)
-                {
-                    state = s;
-                    continue;
-                }
-                self.get_waker().replace(waker);
-                trace_log!("wg:({:?}) set_waker replaced", tokio_task_id!());
-                // clear WAKER_FLAG_LOCK and set WAKER_FLAG_SET
-                self.state.fetch_xor(WAKER_FLAG_MASK, SeqCst)
-            } else {
-                self.get_waker().replace(waker);
-                trace_log!("wg:({:?}) set_waker ok", tokio_task_id!());
-                self.state.fetch_or(WAKER_FLAG_SET, SeqCst)
-            };
+            if s.has_waker() && may_skip {
+                trace_log!("wg:({:?}) set_waker skip", tokio_task_id!());
+                return Ok(());
+            }
+            // Always write the waker under WAKER_FLAG_LOCK: the future returned by wait_async()
+            // can be sent to another thread, so two waiters may reach here concurrently.
+            if let Err(s) = self.state.compare_exchange_weak(state, s.try_lock(), SeqCst, Acquire) {
+                state = s;
+                continue;
+            }
+            self.get_waker().replace(waker);
+            trace_log!("wg:({:?}) set_waker ok", tokio_task_id!());
+            // clear WAKER_FLAG_LOCK and set WAKER_FLAG_SET
+            let old_state = self.state.fetch_xor(WAKER_FLAG_MASK, SeqCst);
             if State::new(old_state).count() <= threshold {
                 return Err(());
             }

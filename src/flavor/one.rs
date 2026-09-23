@@ -23,8 +23,8 @@ pub struct One<T> {
     slots: [Slot<T>; 2],
 }
 
-unsafe impl<T> Sync for One<T> {}
-unsafe impl<T> Send for One<T> {}
+unsafe impl<T: Send> Sync for One<T> {}
+unsafe impl<T: Send> Send for One<T> {}
 
 impl<T> Queue for One<T> {
     type Item = T;

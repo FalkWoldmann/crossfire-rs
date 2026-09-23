@@ -13,6 +13,8 @@ mod test_select_async;
 #[cfg(test)]
 mod test_select_blocking;
 #[cfg(test)]
+mod test_soundness;
+#[cfg(test)]
 mod test_waitgroup;
 
 // we don't want to import smol-timeout

@@ -131,7 +131,7 @@ impl<F: Flavor> AsyncTx<F> {
     /// You should rely on the Drop trait of the message to cleanup.
     #[inline(always)]
     pub fn send<'a>(&'a self, item: F::Item) -> SendFuture<'a, F> {
-        SendFuture { tx: self, item: MaybeUninit::new(item), waker: None }
+        SendFuture { tx: self, item: MaybeUninit::new(item), waker: None, done: false }
     }
 
     /// Attempts to send a message without blocking.
@@ -234,7 +234,13 @@ impl<F: Flavor> AsyncTx<F> {
     where
         FR: Future<Output = R>,
     {
-        SendTimeoutFuture { tx: self, item: MaybeUninit::new(item), waker: None, sleep: fut }
+        SendTimeoutFuture {
+            tx: self,
+            item: MaybeUninit::new(item),
+            waker: None,
+            sleep: fut,
+            done: false,
+        }
     }
 
     /// Internal function might change in the future. For public version, use AsyncSink::poll_send() instead.
@@ -315,6 +321,8 @@ pub struct SendFuture<'a, F: Flavor> {
     tx: &'a AsyncTx<F>,
     item: MaybeUninit<F::Item>,
     waker: Option<<F::Send as Registry>::Waker>,
+    // Set once `item` has been moved out (sent or returned), so it is never read twice.
+    done: bool,
 }
 
 unsafe impl<F: Flavor> Send for SendFuture<'_, F> where F::Item: Send {}
@@ -340,13 +348,16 @@ where
     #[inline]
     fn poll(self: Pin<&mut Self>, ctx: &mut Context) -> Poll<Self::Output> {
         let mut _self = self.get_mut();
+        assert!(!_self.done, "SendFuture polled after completion");
         match _self.tx.poll_send::<false>(ctx, &_self.item, &mut _self.waker) {
             Poll::Ready(Ok(())) => {
                 debug_assert!(_self.waker.is_none());
+                _self.done = true;
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Err(())) => {
                 let _ = _self.waker.take();
+                _self.done = true;
                 Poll::Ready(Err(SendError(unsafe { _self.item.assume_init_read() })))
             }
             Poll::Pending => Poll::Pending,
@@ -365,12 +376,15 @@ where
     sleep: FR,
     item: MaybeUninit<F::Item>,
     waker: Option<<F::Send as Registry>::Waker>,
+    // Set once `item` has been moved out (sent or returned), so it is never read twice.
+    done: bool,
 }
 
 unsafe impl<F, FR, R> Send for SendTimeoutFuture<'_, F, FR, R>
 where
     F: Flavor,
-    FR: Future<Output = R>,
+    FR: Future<Output = R> + Send,
+    F::Item: Send,
 {
 }
 
@@ -403,13 +417,16 @@ where
         // NOTE: we can use unchecked to bypass pin because we are not movig "sleep",
         // neither it's exposed outside
         let mut _self = unsafe { self.get_unchecked_mut() };
+        assert!(!_self.done, "SendTimeoutFuture polled after completion");
         match _self.tx.poll_send::<false>(ctx, &_self.item, &mut _self.waker) {
             Poll::Ready(Ok(())) => {
                 debug_assert!(_self.waker.is_none());
+                _self.done = true;
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Err(())) => {
                 let _ = _self.waker.take();
+                _self.done = true;
                 Poll::Ready(Err(SendTimeoutError::Disconnected(unsafe {
                     _self.item.assume_init_read()
                 })))
@@ -417,6 +434,7 @@ where
             Poll::Pending => {
                 let sleep = unsafe { Pin::new_unchecked(&mut _self.sleep) };
                 if sleep.poll(ctx).is_ready() {
+                    _self.done = true;
                     if _self.tx.shared.abandon_send_waker(&_self.waker.take().unwrap()) {
                         return Poll::Ready(Err(SendTimeoutError::Timeout(unsafe {
                             _self.item.assume_init_read()
@@ -513,7 +531,7 @@ pub trait AsyncTxTrait<T>: fmt::Debug + fmt::Display {
         &self, item: T, fut: FR,
     ) -> impl Future<Output = Result<(), SendTimeoutError<T>>> + Send
     where
-        FR: Future<Output = R>,
+        FR: Future<Output = R> + Send,
         T: Send + 'static + Unpin;
 }
 
@@ -548,7 +566,7 @@ impl<F: Flavor> AsyncTxTrait<F::Item> for AsyncTx<F> {
         &self, item: F::Item, fut: FR,
     ) -> impl Future<Output = Result<(), SendTimeoutError<F::Item>>> + Send
     where
-        FR: Future<Output = R>,
+        FR: Future<Output = R> + Send,
         F::Item: Send + 'static + Unpin,
     {
         AsyncTx::send_with_timer(self, item, fut)
@@ -630,7 +648,7 @@ impl<F: Flavor> AsyncTxTrait<F::Item> for &AsyncTx<F> {
         &self, item: F::Item, fut: FR,
     ) -> impl Future<Output = Result<(), SendTimeoutError<F::Item>>> + Send
     where
-        FR: Future<Output = R>,
+        FR: Future<Output = R> + Send,
         F::Item: Send + 'static + Unpin,
     {
         AsyncTx::send_with_timer(self, item, fut)
@@ -811,7 +829,7 @@ impl<F: Flavor + FlavorMP> AsyncTxTrait<F::Item> for MAsyncTx<F> {
         &self, item: F::Item, fut: FR,
     ) -> impl Future<Output = Result<(), SendTimeoutError<F::Item>>> + Send
     where
-        FR: Future<Output = R>,
+        FR: Future<Output = R> + Send,
         F::Item: Send + 'static + Unpin,
     {
         self.0.send_with_timer::<FR, R>(item, fut)
@@ -893,7 +911,7 @@ impl<F: Flavor + FlavorMP> AsyncTxTrait<F::Item> for &MAsyncTx<F> {
         &self, item: F::Item, fut: FR,
     ) -> impl Future<Output = Result<(), SendTimeoutError<F::Item>>> + Send
     where
-        FR: Future<Output = R>,
+        FR: Future<Output = R> + Send,
         F::Item: Send + 'static + Unpin,
     {
         self.0.send_with_timer::<FR, R>(item, fut)

@@ -82,8 +82,9 @@ pub struct ArrayQueueMpsc<T> {
     one_lap: u32,
 }
 
-unsafe impl<T> Sync for ArrayQueueMpsc<T> {}
-unsafe impl<T> Send for ArrayQueueMpsc<T> {}
+// Not `Sync`: `pop()` assumes a single consumer. Channels share it through `ChannelShared`,
+// whose endpoints enforce that.
+unsafe impl<T: Send> Send for ArrayQueueMpsc<T> {}
 
 impl<T> UnwindSafe for ArrayQueueMpsc<T> {}
 impl<T> RefUnwindSafe for ArrayQueueMpsc<T> {}

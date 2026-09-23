@@ -219,7 +219,7 @@ pub struct FlavorWrap<F, S, R> {
 }
 
 /// break evaluation overflow of F
-unsafe impl<F, S, R> Send for FlavorWrap<F, S, R> {}
+unsafe impl<F: Send, S, R> Send for FlavorWrap<F, S, R> {}
 
 impl<F, S, R> FlavorWrap<F, S, R>
 where
@@ -275,7 +275,7 @@ where
 
 impl<F, S, R> Flavor for FlavorWrap<F, S, R>
 where
-    F: FlavorImpl + 'static,
+    F: FlavorImpl + Send + 'static,
     S: RegistrySend,
     R: RegistryRecv,
 {

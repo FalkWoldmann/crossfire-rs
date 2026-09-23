@@ -374,7 +374,7 @@ where
 unsafe impl<F, FR, R> Send for RecvTimeoutFuture<'_, F, FR, R>
 where
     F: Flavor,
-    FR: Future<Output = R>,
+    FR: Future<Output = R> + Send,
 {
 }
 
@@ -461,7 +461,7 @@ pub trait AsyncRxTrait<T>: fmt::Debug + fmt::Display {
         &self, fut: FR,
     ) -> impl Future<Output = Result<T, RecvTimeoutError>> + Send
     where
-        FR: Future<Output = R>;
+        FR: Future<Output = R> + Send;
 
     /// Try to receive message, non-blocking.
     ///
@@ -516,7 +516,7 @@ impl<F: Flavor> AsyncRxTrait<F::Item> for AsyncRx<F> {
         &self, sleep: FR,
     ) -> impl Future<Output = Result<F::Item, RecvTimeoutError>> + Send
     where
-        FR: Future<Output = R>,
+        FR: Future<Output = R> + Send,
     {
         AsyncRx::recv_with_timer(self, sleep)
     }
@@ -591,7 +591,7 @@ impl<F: Flavor> AsyncRxTrait<F::Item> for &AsyncRx<F> {
         &self, sleep: FR,
     ) -> impl Future<Output = Result<F::Item, RecvTimeoutError>> + Send
     where
-        FR: Future<Output = R>,
+        FR: Future<Output = R> + Send,
     {
         AsyncRx::recv_with_timer(self, sleep)
     }
@@ -755,7 +755,7 @@ impl<F: Flavor + FlavorMC> AsyncRxTrait<F::Item> for MAsyncRx<F> {
         &self, fut: FR,
     ) -> impl Future<Output = Result<F::Item, RecvTimeoutError>>
     where
-        FR: Future<Output = R>,
+        FR: Future<Output = R> + Send,
     {
         self.0.recv_with_timer(fut)
     }
@@ -838,7 +838,7 @@ impl<F: Flavor + FlavorMC> AsyncRxTrait<F::Item> for &MAsyncRx<F> {
         &self, fut: FR,
     ) -> impl Future<Output = Result<F::Item, RecvTimeoutError>>
     where
-        FR: Future<Output = R>,
+        FR: Future<Output = R> + Send,
     {
         self.0.recv_with_timer(fut)
     }

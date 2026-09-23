@@ -30,8 +30,9 @@ pub struct OneSp<T, const MC: bool> {
     slots: [Slot<T>; 2],
 }
 
-unsafe impl<T, const MC: bool> Sync for OneSp<T, MC> {}
-unsafe impl<T, const MC: bool> Send for OneSp<T, MC> {}
+// Not `Sync`: `push()` assumes a single producer (and `pop()` a single consumer when `MC` is
+// false). Channels share it through `ChannelShared`, whose endpoints enforce that.
+unsafe impl<T: Send, const MC: bool> Send for OneSp<T, MC> {}
 
 impl<T, const MC: bool> OneSp<T, MC> {
     #[inline]

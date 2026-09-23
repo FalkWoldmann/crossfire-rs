@@ -102,7 +102,7 @@ impl<T> FlavorBounded for Array<T> {
     }
 }
 
-impl<T: 'static> Flavor for Array<T> {
+impl<T: Send + 'static> Flavor for Array<T> {
     type Send = RegistrySingle;
     type Recv = RegistrySingle;
 }
@@ -155,7 +155,7 @@ where
 #[inline]
 fn unbounded_new<T, R>() -> (Tx<List<T>>, R)
 where
-    T: 'static,
+    T: Send + 'static,
     R: ReceiverType<Flavor = List<T>> + NotCloneable,
 {
     build::<List<T>, Tx<List<T>>, R>(List::<T>::from_inner(crate::flavor::List::<T>::new()))
@@ -164,7 +164,7 @@ where
 #[inline]
 pub fn unbounded_blocking<T>() -> (Tx<List<T>>, Rx<List<T>>)
 where
-    T: 'static,
+    T: Send + 'static,
 {
     unbounded_new()
 }
@@ -172,14 +172,14 @@ where
 #[inline]
 pub fn unbounded_async<T>() -> (Tx<List<T>>, AsyncRx<List<T>>)
 where
-    T: 'static,
+    T: Send + 'static,
 {
     unbounded_new()
 }
 
 fn bounded_new<T, S, R>(size: usize) -> (S, R)
 where
-    T: 'static,
+    T: Send + 'static,
     S: SenderType<Flavor = Array<T>> + NotCloneable,
     R: ReceiverType<Flavor = Array<T>> + NotCloneable,
 {
@@ -192,7 +192,7 @@ where
 #[inline]
 pub fn bounded_blocking<T>(size: usize) -> (Tx<Array<T>>, Rx<Array<T>>)
 where
-    T: 'static,
+    T: Send + 'static,
 {
     bounded_new(size)
 }
@@ -203,7 +203,7 @@ where
 #[inline]
 pub fn bounded_async<T>(size: usize) -> (AsyncTx<Array<T>>, AsyncRx<Array<T>>)
 where
-    T: 'static,
+    T: Send + 'static,
 {
     bounded_new(size)
 }
@@ -214,7 +214,7 @@ where
 #[inline]
 pub fn bounded_blocking_async<T>(size: usize) -> (Tx<Array<T>>, AsyncRx<Array<T>>)
 where
-    T: 'static,
+    T: Send + 'static,
 {
     bounded_new(size)
 }
@@ -225,7 +225,7 @@ where
 #[inline]
 pub fn bounded_async_blocking<T>(size: usize) -> (AsyncTx<Array<T>>, Rx<Array<T>>)
 where
-    T: 'static,
+    T: Send + 'static,
 {
     bounded_new(size)
 }

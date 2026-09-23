@@ -17,8 +17,9 @@ pub struct OneMpsc<T> {
     slots: [Slot<T>; 2],
 }
 
-unsafe impl<T> Sync for OneMpsc<T> {}
-unsafe impl<T> Send for OneMpsc<T> {}
+// Not `Sync`: `pop()` assumes a single consumer. Channels share it through `ChannelShared`,
+// whose endpoints enforce that.
+unsafe impl<T: Send> Send for OneMpsc<T> {}
 
 impl<T> Queue for OneMpsc<T> {
     type Item = T;

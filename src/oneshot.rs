@@ -237,8 +237,8 @@ impl<T> OneShotInner<T> {
 /// Sender for oneshot channel
 pub struct TxOneshot<T>(NonNull<OneShotInner<T>>);
 
-unsafe impl<T> Send for TxOneshot<T> {}
-unsafe impl<T> Sync for TxOneshot<T> {}
+unsafe impl<T: Send> Send for TxOneshot<T> {}
+unsafe impl<T: Send> Sync for TxOneshot<T> {}
 
 impl<T> TxOneshot<T> {
     /// Sending the item is one-time non-blocking behavior
@@ -277,7 +277,7 @@ impl<T> Drop for TxOneshot<T> {
 #[must_use]
 pub struct RxOneshot<T>(Option<NonNull<OneShotInner<T>>>);
 
-unsafe impl<T> Send for RxOneshot<T> {}
+unsafe impl<T: Send> Send for RxOneshot<T> {}
 
 impl<T> Drop for RxOneshot<T> {
     #[inline]
